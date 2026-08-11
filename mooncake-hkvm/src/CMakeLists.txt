@@ -34,3 +34,8 @@ target_include_directories(mooncake_hkvm_diff PUBLIC
   ${MSGPACK_INCLUDE_DIR})
 target_compile_definitions(mooncake_hkvm_diff PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 target_link_libraries(mooncake_hkvm_diff PUBLIC ${ZMQ_LIBRARY})
+
+# Example CLI driver: subscribes to two masters and prints the KV diff.
+add_executable(mooncake_hkvm_diff_example
+  ${CMAKE_SOURCE_DIR}/examples/diff_server_main.cpp)
+target_link_libraries(mooncake_hkvm_diff_example PRIVATE mooncake_hkvm_diff)
