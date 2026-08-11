@@ -313,6 +313,25 @@ void DiffServer::CloseSockets() {
   }
 }
 
+void DiffServer::Rebootstrap() {
+  if (!running_.load()) return;
+  // Flip receivers back into buffering mode (under each mutex so the receiver
+  // observes the change consistently). Events arriving during the snapshot are
+  // captured in `pending` and replayed after seeding — same correctness
+  // argument as the initial bootstrap (see class doc).
+  for (auto& s : masters_) {
+    std::lock_guard<std::mutex> lock(s->mutex);
+    s->buffering = true;
+  }
+  if (config_.snapshot_settle_ms > 0) {
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(config_.snapshot_settle_ms));
+  }
+  for (size_t i = 0; i < masters_.size(); ++i) {
+    BootstrapSnapshot(i);
+  }
+}
+
 void DiffServer::ReceiverLoop(size_t index) {
   MasterState& s = *masters_[index];
   while (!s.stop_flag.load()) {

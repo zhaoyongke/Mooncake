@@ -162,7 +162,109 @@ Link against `mooncake_hkvm_diff` (and libzmq).
 
 ---
 
-## 5. Notes & limitations
+## 5. CopyEngine (reconcile two masters toward identity)
+
+The CopyEngine consumes the DiffServer's two diff lists, copies each
+diff-only key from the master that has it to the master that lacks it (via
+`/query_key` for the source descriptor + `TransferEngine` relay + `PutStart`/
+`PutEnd` on the destination), then calls `DiffServer::Rebootstrap()` to clear
+the diff lists from ground truth.
+
+Unlike the DiffServer, the CopyEngine **requires the full mooncake build** —
+it links `mooncake_store` (MasterClient) and `transfer_engine`. It is therefore
+not built by the standalone path; build it under the top-level mooncake tree
+with `WITH_HKVM=ON`.
+
+### 5.1 Build
+
+From the top-level mooncake checkout (where `mooncake_store` and
+`transfer_engine` targets exist):
+
+```sh
+cmake -S . -B build -DWITH_HKVM=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target mooncake_hkvm_copy mooncake_hkvm_copy_example
+```
+
+Artifacts: `libmooncake_hkvm_copy.a`, `mooncake_hkvm_copy_example`.
+
+The `src/CMakeLists.txt` auto-detects the store/transfer-engine targets and
+skips the CopyEngine otherwise (e.g. in the standalone diff-server build).
+
+### 5.2 Run
+
+The example runs DiffServer + CopyEngine together and reconciles on a timer:
+
+```sh
+./mooncake_hkvm_copy_example \
+  --master1_zmq=tcp://10.0.0.1:5557 --master1_rpc=10.0.0.1:50051 \
+  --master1_host=10.0.0.1 --master1_port=9003 \
+  --master2_zmq=tcp://10.0.0.2:5557 --master2_rpc=10.0.0.2:50051 \
+  --master2_host=10.0.0.2 --master2_port=9003 \
+  --metadata=etcd://10.0.0.1:2379 --local_name=copy-engine-1 \
+  --local_host=10.0.0.1 --transport=tcp --interval=10
+```
+
+Flags (in addition to the DiffServer flags in §3):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `master1_rpc` / `master2_rpc` | `127.0.0.1:50051` / `:50052` | master RPC address for `MasterClient::Connect` |
+| `metadata` | (required) | metadata server conn string, e.g. `etcd://host:2379` |
+| `local_name` | `copy-engine` | unique TransferEngine instance name |
+| `local_host` | `127.0.0.1` | advertised hostname/IP for the TransferEngine |
+| `transfer_port` | `12345` | TransferEngine RPC port |
+| `transport` | `tcp` | transport to install (must match masters' segments; `tcp`/`rdma`) |
+| `interval` | `10` | seconds between reconcile passes |
+
+Each pass prints `copied m1->m2 / m2->m1 / failed` and the diff size before vs.
+after. `Ctrl-C` stops cleanly.
+
+### 5.3 Test
+
+Integration test (extends §4.1):
+
+1. Start two masters (A `5557`/`9003`/RPC `50051`, B `5558`/`9004`/RPC `50052`)
+   sharing one metadata server, both with KV events enabled.
+2. Create divergence: put keys `k1,k2` only into A and `k3` only into B (using
+   any mooncake client / the masters' RPC).
+3. Start the copy example (§5.2).
+4. Within one `--interval`, expect `copied m1->m2: 2, m2->m1: 1, failed: 0`,
+   and the **after** diff sizes to be `0 / 0`.
+5. Verify ground truth converged:
+   ```sh
+   diff <(curl -s http://127.0.0.1:9003/get_all_keys | sort) \
+        <(curl -s http://127.0.0.1:9004/get_all_keys | sort)   # no output
+   ```
+6. Re-diverge (remove a key from one side) and confirm the next pass re-syncs.
+
+Failure-mode checks:
+- `failed > 0` with `after` diff non-zero ⇒ a copy failed; check the engine's
+  transport matches the masters' segment `protocol_` and that the metadata
+  server is reachable.
+- `seq_gaps` rising on the DiffServer ⇒ master publisher overflow (raise
+  `--kv_events_queue_capacity`).
+
+### 5.4 Programmatic use
+
+```cpp
+#include "hkvm/copy_engine.h"
+#include "hkvm/diff_server.h"
+
+mooncake::hkvm::DiffServer diff_server(/*DiffServerConfig*/{...});
+diff_server.Start();
+
+mooncake::hkvm::CopyEngineConfig ccfg;
+/* ...masters, metadata_conn_string, local_server_name, transports... */
+mooncake::hkvm::CopyEngine copy(ccfg, diff_server);
+copy.Start();
+auto stats = copy.RunOnce();   // copies diff keys, then Rebootstraps
+copy.Stop();
+diff_server.Stop();
+```
+
+---
+
+## 6. Notes & limitations
 
 - **PUB/SUB slow-joiner**: a ZMQ subscriber that hasn't finished connecting when
   the snapshot is taken can miss events in that window. `settle_ms` mitigates
@@ -173,3 +275,18 @@ Link against `mooncake_hkvm_diff` (and libzmq).
   (only keys observed via events are tracked). Check `bootstrapped` in stats.
 - **Two masters only** for the two-list diff; `GetDiff()` compares
   `masters_[0]` vs `masters_[1]`.
+- **CopyEngine relay transfer**: bytes are copied remote-source → local
+  registered buffer → remote-destination (two hops), because the
+  `TransferEngine` API transfers between a local and a remote buffer, not
+  between two remote buffers. A per-key local buffer is allocated, registered,
+  and freed per `CopyKey`.
+- **CopyEngine transports**: `installTransport` is called with `nullptr` args,
+  which works for `tcp`/`nvlink`. To copy from/to RDMA segments you must extend
+  `Start()` to pass RDMA device args (as `transfer_engine_validator` does).
+- **CopyEngine JSON parsing**: `/query_key` is parsed with a minimal targeted
+  extractor matched to `HandleQueryKey`'s fixed schema (`size_`,
+  `buffer_address_`, `protocol_`, `transport_endpoint_`). If that schema
+  changes, update `ParseQueryKey` in `src/copy_engine.cpp`.
+- **CopyEngine is full-build only**: it links `mooncake_store` +
+  `transfer_engine`, so it is not produced by the standalone diff-server build
+  (§2 Option A). Build it under the top-level mooncake tree with `WITH_HKVM=ON`.

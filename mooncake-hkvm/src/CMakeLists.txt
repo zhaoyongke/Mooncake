@@ -39,3 +39,21 @@ target_link_libraries(mooncake_hkvm_diff PUBLIC ${ZMQ_LIBRARY})
 add_executable(mooncake_hkvm_diff_example
   ${CMAKE_SOURCE_DIR}/examples/diff_server_main.cpp)
 target_link_libraries(mooncake_hkvm_diff_example PRIVATE mooncake_hkvm_diff)
+
+# --- CopyEngine: reconciles two masters' KV stores toward identity. ---
+# Requires the full mooncake build (mooncake_store + transfer_engine targets).
+# This block is skipped in the standalone diff-server build.
+if(TARGET mooncake_store AND TARGET transfer_engine)
+  add_library(mooncake_hkvm_copy STATIC copy_engine.cpp)
+  target_link_libraries(mooncake_hkvm_copy
+    PUBLIC  mooncake_hkvm_diff
+    PRIVATE mooncake_store transfer_engine)
+
+  add_executable(mooncake_hkvm_copy_example
+    ${CMAKE_SOURCE_DIR}/examples/copy_engine_main.cpp)
+  target_link_libraries(mooncake_hkvm_copy_example PRIVATE mooncake_hkvm_copy)
+else()
+  message(STATUS "mooncake_store/transfer_engine targets not present; "
+                 "skipping mooncake_hkvm_copy (build under top-level mooncake "
+                 "with WITH_HKVM to enable).")
+endif()

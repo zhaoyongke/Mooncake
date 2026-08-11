@@ -83,6 +83,13 @@ class DiffServer {
 
   bool running() const { return running_.load(); }
 
+  // Re-fetches each master's /get_all_keys snapshot and re-seeds the live key
+  // sets (buffering events during the fetch and replaying them). This clears
+  // the derived diff lists by recomputing them from ground truth — use it
+  // after an external reconciler (e.g. CopyEngine) has mutated the masters so
+  // the diff reflects the new reality. No-op if not running.
+  void Rebootstrap();
+
   struct DiffResult {
     std::vector<std::string> only_in_master1;
     std::vector<std::string> only_in_master2;
