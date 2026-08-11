@@ -3,7 +3,15 @@
 #include <msgpack.hpp>
 #include <zmq.h>
 
+#include <cerrno>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <endian.h>
 #include <iostream>
@@ -16,6 +24,10 @@ namespace hkvm {
 namespace {
 
 constexpr const char* kLogTag = "[diff_server]";
+
+// ---------------------------------------------------------------------------
+// msgpack field helpers
+// ---------------------------------------------------------------------------
 
 // Extracts a string field from a msgpack map object. Returns false if the key
 // is absent or the value is not a string.
@@ -62,8 +74,10 @@ bool DecodeObjectKey(const msgpack::object_map& map, std::string& key) {
   return false;
 }
 
-// Receives a complete ZMQ multipart message into `frames`. Returns false on
-// error or if no message is available (caller should poll first).
+// ---------------------------------------------------------------------------
+// ZMQ multipart receive
+// ---------------------------------------------------------------------------
+
 bool RecvMultipart(void* socket, std::vector<std::vector<uint8_t>>& frames) {
   frames.clear();
   while (true) {
@@ -83,7 +97,123 @@ bool RecvMultipart(void* socket, std::vector<std::vector<uint8_t>>& frames) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Minimal HTTP/1.0 GET client (raw sockets, no external HTTP dependency).
+// ---------------------------------------------------------------------------
+
+bool WriteAll(int fd, const char* data, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = write(fd, data + sent, len - sent);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (n == 0) return false;
+    sent += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+// Issues "GET <path> HTTP/1.0" to host:port and returns the response body on
+// HTTP 200. Uses Connection: close and reads until EOF, so no chunked/content
+// -length parsing is needed. `timeout_ms` bounds recv latency.
+bool HttpGetText(const std::string& host, int port, const std::string& path,
+                 int timeout_ms, std::string& body, std::string& err) {
+  struct addrinfo hints{};
+  struct addrinfo* res = nullptr;
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  const std::string port_str = std::to_string(port);
+  if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res) {
+    err = "getaddrinfo failed for " + host;
+    return false;
+  }
+
+  int fd = -1;
+  for (struct addrinfo* p = res; p; p = p->ai_next) {
+    fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd < 0) continue;
+    if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+    close(fd);
+    fd = -1;
+  }
+  freeaddrinfo(res);
+  if (fd < 0) {
+    err = "connect failed to " + host + ":" + port_str;
+    return false;
+  }
+
+  timeval tv;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+  std::string request = "GET " + path +
+                        " HTTP/1.0\r\nHost: " + host +
+                        "\r\nConnection: close\r\n\r\n";
+  if (!WriteAll(fd, request.data(), request.size())) {
+    err = "write failed";
+    close(fd);
+    return false;
+  }
+
+  std::string raw;
+  char buf[8192];
+  ssize_t n;
+  while ((n = read(fd, buf, sizeof(buf))) > 0) {
+    raw.append(buf, static_cast<size_t>(n));
+  }
+  close(fd);
+  if (n < 0) {
+    err = "read failed/timeout";
+    return false;
+  }
+
+  size_t sep = raw.find("\r\n\r\n");
+  if (sep == std::string::npos) {
+    err = "malformed HTTP response (no header/body separator)";
+    return false;
+  }
+  size_t sp = raw.find(' ');
+  if (sp == std::string::npos || raw.compare(0, 5, "HTTP/") != 0) {
+    err = "malformed HTTP status line";
+    return false;
+  }
+  int status = std::atoi(raw.c_str() + sp + 1);
+  if (status != 200) {
+    err = "HTTP status " + std::to_string(status);
+    return false;
+  }
+  body = raw.substr(sep + 4);
+  return true;
+}
+
+// Splits a newline-separated key body into individual keys (empty lines
+// ignored). The master's /get_all_keys emits one key per line.
+std::vector<std::string> SplitLines(const std::string& body) {
+  std::vector<std::string> keys;
+  size_t start = 0;
+  while (start <= body.size()) {
+    size_t nl = body.find('\n', start);
+    if (nl == std::string::npos) {
+      std::string line = body.substr(start);
+      if (!line.empty()) keys.push_back(std::move(line));
+      break;
+    }
+    std::string line = body.substr(start, nl - start);
+    if (!line.empty()) keys.push_back(std::move(line));
+    start = nl + 1;
+  }
+  return keys;
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// DiffServer
+// ---------------------------------------------------------------------------
 
 DiffServer::DiffServer(DiffServerConfig config)
     : config_(std::move(config)) {
@@ -122,7 +252,6 @@ bool DiffServer::Start() {
     }
     int hwm = config_.recv_hwm;
     zmq_setsockopt(s->socket, ZMQ_RCVHWM, &hwm, sizeof(hwm));
-    // Don't block forever on close while events are queued.
     int linger_ms = 0;
     zmq_setsockopt(s->socket, ZMQ_LINGER, &linger_ms, sizeof(linger_ms));
     if (zmq_setsockopt(s->socket, ZMQ_SUBSCRIBE, "", 0) != 0) {
@@ -139,13 +268,25 @@ bool DiffServer::Start() {
     }
   }
 
+  running_.store(true);
+
+  // Start receivers in buffering mode so no event between SUB connect and the
+  // snapshot is lost.
   for (size_t i = 0; i < masters_.size(); ++i) {
     masters_[i]->stop_flag.store(false);
-    masters_[i]->thread =
-        std::thread(&DiffServer::ReceiverLoop, this, i);
+    masters_[i]->thread = std::thread(&DiffServer::ReceiverLoop, this, i);
   }
 
-  running_.store(true);
+  // Let SUB connections establish before snapshotting so the buffered replay
+  // covers the snapshot boundary (see class doc).
+  if (config_.snapshot_settle_ms > 0) {
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(config_.snapshot_settle_ms));
+  }
+
+  for (size_t i = 0; i < masters_.size(); ++i) {
+    BootstrapSnapshot(i);
+  }
   return true;
 }
 
@@ -182,8 +323,7 @@ void DiffServer::ReceiverLoop(size_t index) {
     item.revents = 0;
     int rc = zmq_poll(&item, 1, config_.poll_timeout_ms);
     if (rc < 0) {
-      // ETERM indicates the context is being torn down during shutdown.
-      if (zmq_errno() == ETERM) break;
+      if (zmq_errno() == ETERM) break;  // context torn down during shutdown
       continue;
     }
     if (rc == 0) continue;  // timeout, re-check stop_flag
@@ -243,6 +383,16 @@ bool DiffServer::ApplyEvent(MasterState& s, const void* payload, size_t size) {
         continue;
       }
 
+      bool stored;
+      if (event_type == "stored") {
+        stored = true;
+      } else if (event_type == "removed") {
+        stored = false;
+      } else {
+        s.malformed_events.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+
       if (!s.config.backend_id_filter.empty()) {
         std::string backend_id;
         if (!GetStrField(map, "backend_id", backend_id) ||
@@ -258,24 +408,79 @@ bool DiffServer::ApplyEvent(MasterState& s, const void* payload, size_t size) {
       }
 
       s.events_received.fetch_add(1, std::memory_order_relaxed);
-      {
-        std::lock_guard<std::mutex> lock(s.mutex);
-        if (event_type == "stored") {
-          s.live_keys.insert(object_key);
-          s.stored_events.fetch_add(1, std::memory_order_relaxed);
-        } else if (event_type == "removed") {
-          s.live_keys.erase(object_key);
-          s.removed_events.fetch_add(1, std::memory_order_relaxed);
-        } else {
-          s.malformed_events.fetch_add(1, std::memory_order_relaxed);
-        }
+      if (stored) {
+        s.stored_events.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        s.removed_events.fetch_add(1, std::memory_order_relaxed);
       }
+      RecordEvent(s, stored, object_key);
     }
     return true;
-  } catch (const std::exception& e) {
+  } catch (const std::exception&) {
     s.malformed_events.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
+}
+
+void DiffServer::RecordEvent(MasterState& s, bool stored,
+                             const std::string& key) {
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (s.buffering) {
+    s.pending.push_back(MasterState::PendingEvent{stored, key});
+  } else {
+    if (stored) {
+      s.live_keys.insert(key);
+    } else {
+      s.live_keys.erase(key);
+    }
+  }
+}
+
+void DiffServer::BootstrapSnapshot(size_t index) {
+  MasterState& s = *masters_[index];
+  std::vector<std::string> keys;
+
+  if (s.config.http_host.empty() || s.config.metrics_port <= 0) {
+    std::cerr << kLogTag << " " << s.config.id
+              << ": no snapshot configured, running event-only\n";
+    DrainAndGoLive(s, std::move(keys));
+    return;
+  }
+
+  std::string body, err;
+  if (!HttpGetText(s.config.http_host, s.config.metrics_port, "/get_all_keys",
+                   config_.snapshot_timeout_ms, body, err)) {
+    std::cerr << kLogTag << " " << s.config.id
+              << ": snapshot fetch failed (" << err << "), event-only fallback\n";
+    DrainAndGoLive(s, std::move(keys));
+    return;
+  }
+  keys = SplitLines(body);
+  std::cerr << kLogTag << " " << s.config.id << ": snapshot seeded "
+            << keys.size() << " keys\n";
+  DrainAndGoLive(s, std::move(keys));
+}
+
+void DiffServer::DrainAndGoLive(MasterState& s,
+                                std::vector<std::string> snapshot_keys) {
+  std::lock_guard<std::mutex> lock(s.mutex);
+  // Seed from the snapshot (master state as-of request time T_q).
+  s.live_keys.clear();
+  for (auto& k : snapshot_keys) s.live_keys.insert(std::move(k));
+  s.snapshot_key_count.store(s.live_keys.size(),
+                             std::memory_order_relaxed);
+  // Replay all events buffered since SUB connect (T_c < T_q), in arrival
+  // order. This reconciles the snapshot with concurrent mutations.
+  for (const auto& e : s.pending) {
+    if (e.stored) {
+      s.live_keys.insert(e.key);
+    } else {
+      s.live_keys.erase(e.key);
+    }
+  }
+  s.pending.clear();
+  s.buffering = false;
+  s.bootstrapped.store(true, std::memory_order_relaxed);
 }
 
 DiffServer::DiffResult DiffServer::GetDiff() const {
@@ -314,6 +519,9 @@ std::vector<DiffServer::MasterStats> DiffServer::GetStats() const {
     st.seq_gaps = s->seq_gaps.load(std::memory_order_relaxed);
     st.last_seq = s->last_seq.load(std::memory_order_relaxed);
     st.has_last_seq = s->has_last_seq.load(std::memory_order_relaxed);
+    st.snapshot_key_count =
+        s->snapshot_key_count.load(std::memory_order_relaxed);
+    st.bootstrapped = s->bootstrapped.load(std::memory_order_relaxed);
     out.push_back(st);
   }
   return out;
