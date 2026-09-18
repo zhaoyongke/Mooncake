@@ -2,11 +2,15 @@
 // (C) Sebastian Aaltonen 2023
 // MIT License (see file: LICENSE)
 
+#include <atomic>
 #include <memory>
 #include <optional>
+#include <string>
+#include <type_traits>
 #include <vector>
 #include <algorithm>
 #include <glog/logging.h>
+#include <ylt/util/tl/expected.hpp>
 
 #include "mutex.h"
 #include "serialize/serializer.h"
@@ -20,6 +24,7 @@ using NodeIndex = uint32;
 // Forward declarations
 class OffsetAllocator;
 class __Allocator;
+struct OffsetAllocatorSnapshot;
 
 static constexpr uint32 NUM_TOP_BINS = 32;
 static constexpr uint32 BINS_PER_LEAF = 8;
@@ -170,6 +175,14 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // the request cannot be represented by this allocator.
     [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const;
 
+    // Returns a mutex-free atomic upper-bound hint for the largest allocatable
+    // free region. The hint may be larger than the current value after a
+    // successful allocation, is tightened on a locked allocation failure, and
+    // is raised when free creates a larger region.
+    [[nodiscard]] uint64_t getLargestFreeRegion() const noexcept {
+        return m_largest_free_region.load(std::memory_order_relaxed);
+    }
+
     // Get storage report (thread-safe)
     [[nodiscard]]
     OffsetAllocStorageReport storageReport() const;
@@ -181,6 +194,15 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Get comprehensive metrics including fragmentation analysis (thread-safe)
     [[nodiscard]]
     OffsetAllocatorMetrics get_metrics() const;
+
+    // Deep-copy persisted layout without locking. Only for a forked snapshot
+    // child or externally quiesced state; the result owns no live resources.
+    OffsetAllocatorSnapshot CaptureSnapshot() const;
+
+    // Consumes a captured snapshot and rebuilds the allocator from its layout.
+    // Validates before installing any state; returns a diagnostic on failure.
+    static tl::expected<std::shared_ptr<OffsetAllocator>, std::string> Restore(
+        OffsetAllocatorSnapshot snapshot);
 
     // Serialize the allocator with serializer.
     template <typename T>
@@ -200,6 +222,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     OffsetAllocatorMetrics get_metrics_internal() const REQUIRES(m_mutex);
 
+    void refreshLargestFreeRegion() REQUIRES(m_mutex);
+
     std::unique_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
     uint64_t m_base;
     // The real offset and size of the allocated memory need to be multiplied by
@@ -211,6 +235,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Lightweight metrics maintained during allocation/deallocation
     uint64_t m_allocated_size GUARDED_BY(m_mutex) = 0;
     uint64_t m_allocated_num GUARDED_BY(m_mutex) = 0;
+    std::atomic<uint64_t> m_largest_free_region{0};
+    bool m_largest_free_region_tightened GUARDED_BY(m_mutex) = false;
 
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
@@ -232,14 +258,19 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 class __Allocator {
    public:
     __Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity);
+    // Excludes __Allocator itself, so copy construction never resolves to this
+    // serializer overload instead of the copy constructor.
     template <typename T>
+        requires(!std::is_same_v<std::remove_cvref_t<T>, __Allocator>)
     __Allocator(T& serializer) noexcept(false);
     __Allocator(__Allocator&& other);
     ~__Allocator() = default;
     void reset();
 
     OffsetAllocation allocate(uint32 size);
-    void free(OffsetAllocation allocation);
+    // Returns the size of the newly merged free region, or zero if allocator
+    // metadata capacity still prevents another allocation.
+    uint32 free(OffsetAllocation allocation);
 
     uint32 allocationSize(OffsetAllocation allocation) const;
     OffsetAllocStorageReport storageReport() const;
@@ -250,6 +281,9 @@ class __Allocator {
     void serialize_to(T& serializer) const;
 
    private:
+    // Detaches the bin/node state for OffsetAllocator::CaptureSnapshot().
+    __Allocator(const __Allocator&) = default;
+
     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
     void removeNodeFromBin(uint32 nodeIndex);
 
@@ -280,7 +314,56 @@ class __Allocator {
 
     friend class OffsetAllocatorTest;  // for unit tests
     friend class mooncake::Serializer<__Allocator>;
+    friend struct OffsetAllocatorSnapshot;
     friend class OffsetAllocator;  // for visit_used_nodes / createHandleAtNode
+};
+
+// Owned allocation metadata. No runtime allocator, handles or mutex are
+// retained. The internal bin/node layout is deeply copied during capture.
+struct OffsetAllocatorSnapshot {
+    uint64_t base;
+    uint64_t multiplier_bits;
+    uint64_t capacity;
+    uint64_t allocated_size;
+    uint64_t allocated_num;
+    std::unique_ptr<__Allocator> layout;
+
+    // The host-memory allocator supports up to 64Mi metadata nodes. This is
+    // independent of the smaller limit used by the storage backend's byte
+    // serializer, and must allow snapshots of large memory segments.
+    static constexpr uint32_t kMaxNodes = 1u << 26;
+
+    // Used by the wire decoder before allocating/decompressing node storage.
+    static tl::expected<void, std::string> ValidateNodeCapacity(
+        uint32_t size, uint32_t current_capacity, uint32_t max_capacity,
+        uint32_t free_offset);
+
+    // Pure validation: no runtime allocator, metrics, logging or mutation.
+    // Checks headers before shifts, then layout topology and usage accounting.
+    // Requested sizes are not persisted per node, so allocated_size must lie
+    // within the range permitted by bin/unit rounding, not equal occupied
+    // bytes.
+    [[nodiscard]] tl::expected<void, std::string> Validate() const;
+
+   private:
+    enum class NodeState : uint8_t { kUnclassified, kUsed, kFree, kSpare };
+    struct LayoutUsage {
+        uint64_t used_nodes = 0;
+        uint64_t min_used_bytes = 0;
+        uint64_t max_used_bytes = 0;
+    };
+
+    tl::expected<void, std::string> ValidateHeader() const;
+    tl::expected<LayoutUsage, std::string> ValidateUsedNodes(
+        std::vector<NodeState>& state) const;
+    tl::expected<uint32_t, std::string> ValidateBins(
+        std::vector<NodeState>& state) const;
+    tl::expected<void, std::string> ValidateFreeStack(
+        std::vector<NodeState>& state, uint32_t live_nodes) const;
+    tl::expected<void, std::string> ValidateNeighborChain(
+        const std::vector<NodeState>& state, uint32_t live_nodes) const;
+    tl::expected<void, std::string> ValidateAccounting(
+        const LayoutUsage& usage) const;
 };
 
 // Template method implementations
@@ -330,6 +413,14 @@ OffsetAllocator::OffsetAllocator(T& serializer) {
                 "Deserializing OffsetAllocator failed: corrupt header");
         }
         m_allocator = std::make_unique<__Allocator>(serializer);
+        const uint64_t largest_free_region =
+            m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
+        m_largest_free_region.store(largest_free_region,
+                                    std::memory_order_relaxed);
+        const uint64_t allocator_capacity =
+            static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
+        m_largest_free_region_tightened =
+            largest_free_region < allocator_capacity;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing OffsetAllocator failed, error="
                    << e.what();
@@ -358,6 +449,7 @@ void __Allocator::serialize_to(T& serializer) const {
 }
 
 template <typename T>
+    requires(!std::is_same_v<std::remove_cvref_t<T>, __Allocator>)
 __Allocator::__Allocator(T& serializer) {
     // serializer.read() will throw an exception if the buffer is corrupted.
     try {

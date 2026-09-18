@@ -14,7 +14,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "mutex.h"
-#include "utils.h"
+#include "common/result.h"
 #include "file_storage.h"
 
 namespace mooncake {
@@ -60,8 +60,8 @@ build_ranged_read_results_like(
                     ? all_dst_offsets[i][j].size()
                     : 1;
             std::vector<ResultValue> fragments;
-            fragments.reserve(std::max<size_t>(fragment_count, 1));
-            for (size_t k = 0; k < std::max<size_t>(fragment_count, 1); ++k) {
+            fragments.reserve(fragment_count);
+            for (size_t k = 0; k < fragment_count; ++k) {
                 fragments.push_back(make_error());
             }
             key_rows.emplace_back(std::move(fragments));
@@ -143,6 +143,10 @@ class ClientRequester {
    public:
     ClientRequester();
 
+    // Drains in-flight offload RPCs before the pools member is released
+    // (#3909).
+    ~ClientRequester();
+
     /**
      * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
      * @param client_addr Network address (e.g., "ip:port") of the remote
@@ -194,6 +198,7 @@ class ClientRequester {
     mutable std::shared_mutex client_pool_mutex_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
+    RpcDrainGuard rpc_drain_;
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
@@ -294,6 +299,57 @@ class PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    // Put/get sessions. Default stubs keep DummyClient unchanged; RealClient
+    // overrides with the real implementations.
+    virtual std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_src_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual int batch_get_session_end(
+        const std::vector<std::string> & /*keys*/) {
+        return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    }
+
+    virtual std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> & /*sizes*/,
+        const ReplicateConfig & /*config*/ = ReplicateConfig{}) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_dst_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;
 
@@ -319,6 +375,12 @@ class PyClient {
     virtual std::vector<int> batch_upsert_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
     virtual int upsert_parts(
@@ -418,7 +480,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     if (!cached_result.success) {
         return tl::make_unexpected(cached_result.error);
     }
-    return QueryResult(
+    return tl::expected<QueryResult, ErrorCode>(
+        tl::in_place,
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
